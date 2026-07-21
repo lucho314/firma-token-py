@@ -1,0 +1,10 @@
+pyhanko[pkcs11]==0.35.1
+python-dotenv>=1.0.0
+flask>=3.0.0
+flask-cors>=4.0.0
+requests>=2.31.0
+pyhanko-certvalidator>=0.31.1,<0.32
+pyOpenSSL>=24.0.0
+cryptography>=43.0.0
+pystray>=0.19.5
+pillow>=10.0.0
