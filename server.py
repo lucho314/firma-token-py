@@ -33,13 +33,15 @@ else:
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 # .env por defecto en el primer arranque, así el usuario tiene qué editar.
+# BASE_URL apunta al portal (backend de documentos); PORT es el puerto LOCAL
+# donde escucha este servicio de firma (el navegador le pega a 127.0.0.1:PORT).
 _env_file = DATA_DIR / ".env"
 if not _env_file.exists():
-    _env_file.write_text("BASE_URL=http://localhost:3000\nPORT=8765\n", encoding="utf-8")
+    _env_file.write_text("BASE_URL=https://portalt.ater.gob.ar\nPORT=8765\n", encoding="utf-8")
 
 load_dotenv(_env_file)
 
-BASE_URL   = os.getenv("BASE_URL", "http://localhost:3000").rstrip("/")
+BASE_URL   = os.getenv("BASE_URL", "https://portalt.ater.gob.ar").rstrip("/")
 PORT       = int(os.getenv("PORT", "8765"))
 OUTPUT_DIR = DATA_DIR / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
