@@ -115,22 +115,43 @@ def _get_signer(cuit_esperado: str | None = None):
 
 # ── Firma un PDF en memoria ───────────────────────────────────────────────────
 
+def _nombre_campo_libre(reader) -> tuple[str, int]:
+    """
+    Devuelve (nombre, indice) del próximo campo de firma libre 'SignatureN'.
+    Permite acumular firmas: si el PDF ya trae la firma del primer profesional,
+    el segundo agrega 'Signature2' en vez de chocar con 'Signature1'.
+    """
+    from pyhanko.sign.fields import enumerate_sig_fields
+    existentes = {name for name, *_ in enumerate_sig_fields(reader)}
+    n = 1
+    while f"Signature{n}" in existentes:
+        n += 1
+    return f"Signature{n}", n
+
+
 def _sign_pdf(pdf_bytes: bytes, cuit_esperado: str | None = None) -> bytes:
     signer = _get_signer(cuit_esperado)
 
     src    = io.BytesIO(pdf_bytes)
     reader = PdfFileReader(src, strict=False)
+
+    # Nombre de campo único: soporta múltiples firmantes sobre el mismo documento.
+    field_name, idx = _nombre_campo_libre(reader)
+    # Cada firma visible se apila hacia arriba para no solaparse con la anterior.
+    dy  = (idx - 1) * 60
+    box = (50, 50 + dy, 300, 100 + dy)
+
     writer = IncrementalPdfFileWriter.from_reader(reader)
 
     out = io.BytesIO()
     signers.sign_pdf(
         writer,
-        signature_meta=signers.PdfSignatureMetadata(field_name="Signature1"),
+        signature_meta=signers.PdfSignatureMetadata(field_name=field_name),
         signer=signer,
         new_field_spec=SigFieldSpec(
-            sig_field_name="Signature1",
+            sig_field_name=field_name,
             on_page=0,
-            box=(50, 50, 300, 100),
+            box=box,
         ),
         output=out,
     )
@@ -139,9 +160,28 @@ def _sign_pdf(pdf_bytes: bytes, cuit_esperado: str | None = None) -> bytes:
 
 # ── Obtiene paquete pendiente de la API ───────────────────────────────────────
 
-def _fetch_paquete(token: str) -> dict:
+def _cuit_local() -> str | None:
+    """
+    CUIT del certificado del token conectado (el que se usará para firmar).
+    Se envía al backend para que devuelva los documentos que le tocan a ESTE
+    profesional. None si no hay token/cert conectado.
+    """
+    try:
+        from windows_cng import list_cng_certs
+        for c in list_cng_certs():
+            if c.get("cuit"):
+                return c["cuit"]
+    except Exception as e:
+        print(f"No se pudo leer el CUIT del token: {e}")
+    return None
+
+
+def _fetch_paquete(token: str, cuit: str | None = None) -> dict:
     url     = f"{BASE_URL}/api/firmador/documentos-pendientes"
-    payload = json.dumps({"Token": token}).encode()
+    cuerpo  = {"Token": token}
+    if cuit:
+        cuerpo["Cuit"] = cuit
+    payload = json.dumps(cuerpo).encode()
     req     = urllib.request.Request(
         url,
         data=payload,
@@ -342,14 +382,19 @@ def firmar():
     _purgar_jobs()
 
     try:
+        # CUIT del token conectado: se envía al backend para que devuelva sólo los
+        # documentos que le tocan a ESTE profesional (titular o interviniente), y es
+        # el certificado con el que se firma.
+        cuit = _cuit_local()
+        print(f"CUIT del token local: {cuit or 'no detectado'}")
+
         # Descarga sincrónica del ZIP (rápido) — la firma va en background
-        paquete     = _fetch_paquete(token)
+        paquete     = _fetch_paquete(token, cuit)
         zip_bytes   = paquete["_raw"]
         nuevo_token = paquete["_nuevo_token"]
         cantidad    = paquete["_cantidad"]
-        cuit        = paquete["_cuit"]
         print(f"Zip recibido: {len(zip_bytes)} bytes | {cantidad} documento(s) | "
-              f"CUIT firmante: {cuit or 'no informado'}")
+              f"firma con CUIT: {cuit or 'sin filtro'}")
 
         job_id = uuid.uuid4().hex
         with _jobs_lock:
