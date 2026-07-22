@@ -32,6 +32,7 @@ def list_via_pkcs11(lib_path: str) -> bool:
     from pkcs11 import Attribute, ObjectClass
     from cryptography import x509
     from cryptography.hazmat.backends import default_backend
+    from windows_cng import cuit_de_cert
 
     print(f"Backend: PKCS#11  |  Librería: {lib_path}")
     lib = pkcs11.lib(lib_path)
@@ -66,6 +67,7 @@ def list_via_pkcs11(lib_path: str) -> bool:
                     now  = datetime.datetime.now(datetime.timezone.utc)
                     print(f"\n  Cert [{i}]:")
                     print(f"    CN:       {cn[0].value if cn else 'N/A'}")
+                    print(f"    CUIT:     {cuit_de_cert(cert) or 'no detectado'}")
                     print(f"    Emisor:   {cert.issuer.rfc4514_string()}")
                     print(f"    Válido:   {cert.not_valid_before_utc.date()} -> {cert.not_valid_after_utc.date()}")
                     print(f"    Expirado: {'SÍ' if cert.not_valid_after_utc < now else 'NO'}")
@@ -90,6 +92,7 @@ def list_via_windows_cng():
     for i, c in enumerate(certs):
         print(f"\n  Cert [{i}]:")
         print(f"    CN:       {c['cn']}")
+        print(f"    CUIT:     {c.get('cuit') or 'no detectado'}")
         print(f"    Emisor:   {c['issuer']}")
         print(f"    Válido:   {c['valid_from']} -> {c['valid_to']}")
 

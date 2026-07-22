@@ -4,6 +4,7 @@ Usado cuando no hay DLL PKCS#11 disponible.
 No requiere dependencias externas más allá de las ya declaradas.
 """
 
+import re
 import sys
 import ctypes
 import ssl
@@ -13,6 +14,33 @@ from typing import Optional
 
 from cryptography import x509 as crypto_x509
 from cryptography.hazmat.backends import default_backend
+
+
+class FirmanteNoAutorizadoError(RuntimeError):
+    """El certificado del token no corresponde al CUIT del firmante requerido."""
+
+
+def cuit_de_cert(cert) -> str | None:
+    """
+    Extrae el CUIT (11 dígitos, sin guiones) del certificado.
+    Busca primero en el serialNumber del subject (ubicación estándar de las AC
+    argentinas, p.ej. 'CUIL 20-12345678-9'); si no aparece, escanea todo el subject.
+    Retorna None si no encuentra un patrón de CUIT.
+    """
+    def _extraer(texto: str) -> str | None:
+        if not texto:
+            return None
+        m = re.search(r'(\d{2}-?\d{8}-?\d)', texto)
+        return re.sub(r'\D', '', m.group(1)) if m else None
+
+    # 1) serialNumber (OID 2.5.4.5) del subject
+    for attr in cert.subject.get_attributes_for_oid(crypto_x509.oid.NameOID.SERIAL_NUMBER):
+        cuit = _extraer(attr.value)
+        if cuit:
+            return cuit
+
+    # 2) Fallback: cualquier atributo del subject (CN, etc.)
+    return _extraer(cert.subject.rfc4514_string())
 
 # ── Constantes CNG ────────────────────────────────────────────────────────────
 CRYPT_ACQUIRE_ONLY_NCRYPT_KEY_FLAG = 0x00040000
@@ -152,6 +180,7 @@ def list_cng_certs(cn_filter: str | None = None) -> list[dict]:
 
         results.append({
             "cn":         cn,
+            "cuit":       cuit_de_cert(cert),
             "issuer":     cert.issuer.rfc4514_string(),
             "valid_from": cert.not_valid_before_utc.date(),
             "valid_to":   cert.not_valid_after_utc.date(),
@@ -221,10 +250,13 @@ def _acquire_ncrypt_key(cert_der: bytes) -> int:
 
 
 # ── Signer para pyhanko ───────────────────────────────────────────────────────
-def make_cng_signer(cn_filter: str | None = None):
+def make_cng_signer(cn_filter: str | None = None, cuit_esperado: str | None = None):
     """
     Construye un pyhanko Signer usando Windows CNG.
     Si hay múltiples certs válidos, pregunta al usuario.
+
+    cuit_esperado: si se indica, sólo se admite un certificado cuyo CUIT coincida.
+    Lanza FirmanteNoAutorizadoError si ningún cert conectado corresponde a ese CUIT.
     """
     from asn1crypto import x509 as asn1_x509
     from pyhanko.sign.signers.pdf_cms import Signer as PyhankSigner
@@ -233,6 +265,22 @@ def make_cng_signer(cn_filter: str | None = None):
     certs = list_cng_certs(cn_filter)
     if not certs:
         raise RuntimeError("No hay certificados de firma válidos en Windows-MY")
+
+    # Verificación del firmante: el token conectado debe pertenecer al CUIT que el
+    # backend indicó como habilitado a firmar. Barrera local (UX) — la definitiva la
+    # hace el backend al validar el cert dentro del PDF firmado.
+    if cuit_esperado:
+        cuit_norm = re.sub(r'\D', '', str(cuit_esperado))
+        coincidentes = [c for c in certs if c.get("cuit") == cuit_norm]
+        if not coincidentes:
+            disponibles = ", ".join(
+                f"{c['cn']} (CUIT {c.get('cuit') or 's/d'})" for c in certs
+            ) or "ninguno"
+            raise FirmanteNoAutorizadoError(
+                f"El token conectado no corresponde al firmante requerido "
+                f"(CUIT {cuit_norm}). Certificados en el equipo: {disponibles}."
+            )
+        certs = coincidentes
 
     if len(certs) > 1 and sys.stdin is not None and sys.stdin.isatty():
         print("\nCertificados disponibles en Windows-MY:")

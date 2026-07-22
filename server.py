@@ -7,6 +7,7 @@ GET  /health
 """
 
 import io
+import re
 import json
 import time
 import uuid
@@ -39,11 +40,16 @@ _env_file = DATA_DIR / ".env"
 if not _env_file.exists():
     _env_file.write_text("BASE_URL=https://portalt.ater.gob.ar\nPORT=8765\n", encoding="utf-8")
 
-load_dotenv(_env_file)
+# override=True: el .env manda siempre. Sin esto, una variable de entorno BASE_URL
+# preexistente (heredada del proceso que lanza la app) pisa el archivo y el usuario
+# edita el .env sin efecto.
+load_dotenv(_env_file, override=True)
 
 BASE_URL   = os.getenv("BASE_URL", "https://portalt.ater.gob.ar").rstrip("/")
 PORT       = int(os.getenv("PORT", "8765"))
 OUTPUT_DIR = DATA_DIR / "output"
+
+print(f"Config   : {_env_file}")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 from flask import Flask, request, jsonify
@@ -52,7 +58,7 @@ from pyhanko.sign import signers
 from pyhanko.sign.fields import SigFieldSpec
 from pyhanko.pdf_utils.reader import PdfFileReader
 from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
-from windows_cng import make_cng_signer
+from windows_cng import make_cng_signer, FirmanteNoAutorizadoError
 
 app = Flask(__name__)
 CORS(app)
@@ -78,7 +84,9 @@ print(f"Output   : {OUTPUT_DIR}")
 # El signer se inicializa perezosamente (al firmar), no al arrancar — así el
 # server levanta aunque el token no esté conectado, y el error se reporta como
 # mensaje claro en el job en vez de crashear el arranque.
-_signer = None
+# Se cachea por CUIT esperado (clave None = sin verificación de firmante), porque
+# el certificado del equipo es estable pero la firma puede exigir CUITs distintos.
+_signers: dict[str | None, object] = {}
 _signer_lock = threading.Lock()
 
 
@@ -86,23 +94,29 @@ class TokenNoDisponibleError(Exception):
     """No hay token/certificado de firma disponible en el equipo."""
 
 
-def _get_signer():
-    """Obtiene (o construye) el signer CNG. Lanza TokenNoDisponibleError si no hay cert."""
-    global _signer
+def _get_signer(cuit_esperado: str | None = None):
+    """
+    Obtiene (o construye) el signer CNG para el CUIT esperado.
+    Lanza FirmanteNoAutorizadoError si el token no corresponde a ese CUIT,
+    o TokenNoDisponibleError si no hay ningún cert de firma en el equipo.
+    """
+    clave = re.sub(r"\D", "", cuit_esperado) if cuit_esperado else None
     with _signer_lock:
-        if _signer is None:
-            print("Inicializando signer CNG...")
+        if clave not in _signers:
+            print(f"Inicializando signer CNG (CUIT {clave or 'sin filtro'})...")
             try:
-                _signer = make_cng_signer()
+                _signers[clave] = make_cng_signer(cuit_esperado=cuit_esperado)
+            except FirmanteNoAutorizadoError:
+                raise  # firmante equivocado — mensaje propio, no lo enmascares
             except Exception as e:
                 raise TokenNoDisponibleError(str(e)) from e
-        return _signer
+        return _signers[clave]
 
 
 # ── Firma un PDF en memoria ───────────────────────────────────────────────────
 
-def _sign_pdf(pdf_bytes: bytes) -> bytes:
-    signer = _get_signer()
+def _sign_pdf(pdf_bytes: bytes, cuit_esperado: str | None = None) -> bytes:
+    signer = _get_signer(cuit_esperado)
 
     src    = io.BytesIO(pdf_bytes)
     reader = PdfFileReader(src, strict=False)
@@ -140,19 +154,23 @@ def _fetch_paquete(token: str) -> dict:
             "_raw":         raw,
             "_nuevo_token": resp.headers.get("X-Firmador-Token", ""),
             "_cantidad":    int(resp.headers.get("X-Firmador-Documentos", "0")),
+            "_cuit":        resp.headers.get("X-Firmador-Cuit", ""),
         }
 
 
 # ── Utilidades ────────────────────────────────────────────────────────────────
 
-def _finalizar_job(job_id: str, estado: str, error: str | None = None) -> None:
-    """Marca un job como terminado y sella la hora, para que luego pueda purgarse."""
+def _finalizar_job(job_id: str, estado: str, error: str | None = None,
+                   detalle: str | None = None) -> None:
+    """Marca un job como terminado y sella la hora, para que luego pueda purgarse.
+    'error' es el mensaje amigable; 'detalle' es la causa técnica (para soporte)."""
     with _jobs_lock:
         job = _jobs.get(job_id)
         if job is None:
             return
         job["estado"] = estado
         job["error"] = error
+        job["detalle"] = detalle
         job["fin"] = time.time()
 
 
@@ -225,7 +243,7 @@ def _subir_firmados(token: str, firmados: list[dict]) -> None:
 
 # ── Procesa paquete en background: deszip → firma → guarda → sube ─────────────
 
-def _procesar_job(job_id: str, zip_bytes: bytes) -> None:
+def _procesar_job(job_id: str, zip_bytes: bytes, cuit_firmante: str | None = None) -> None:
     """Firma cada PDF del ZIP, lo guarda de respaldo y sube los firmados al backend."""
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -239,7 +257,7 @@ def _procesar_job(job_id: str, zip_bytes: bytes) -> None:
 
             for nombre in pdfs:
                 pdf_bytes    = zf.read(nombre)
-                signed_bytes = _sign_pdf(pdf_bytes)
+                signed_bytes = _sign_pdf(pdf_bytes, cuit_firmante)
 
                 stem     = Path(nombre).stem
                 out_name = f"{stem}_firmado_{ts}.pdf"
@@ -276,6 +294,14 @@ def _procesar_job(job_id: str, zip_bytes: bytes) -> None:
         _finalizar_job(job_id, "completado")
         print(f"Job {job_id} completado.")
 
+    except FirmanteNoAutorizadoError as e:
+        print(f"Firmante no autorizado: {e}")
+        _finalizar_job(
+            job_id, "error",
+            "El token conectado no corresponde al firmante de estos documentos. "
+            "Verificá que sea el dispositivo del profesional habilitado.",
+        )
+
     except TokenNoDisponibleError:
         print("No hay token/certificado de firma disponible.")
         _finalizar_job(
@@ -284,9 +310,19 @@ def _procesar_job(job_id: str, zip_bytes: bytes) -> None:
             "Conectá el dispositivo y volvé a intentar.",
         )
 
-    except Exception:
+    except Exception as e:
         print(traceback.format_exc())
-        _finalizar_job(job_id, "error", "Error al firmar los documentos.")
+        detalle = f"{type(e).__name__}: {e}"
+
+        # Documento que ya trae una firma en el mismo campo: el backend devolvió como
+        # pendiente un PDF ya firmado. Mensaje específico en vez del genérico.
+        if "appears to be filled already" in str(e):
+            mensaje = ("Uno de los documentos ya estaba firmado (el servidor lo devolvió "
+                       "como pendiente). No se firmó nada. Avisá a soporte.")
+        else:
+            mensaje = "Error al firmar los documentos."
+
+        _finalizar_job(job_id, "error", mensaje, detalle=detalle)
 
 
 # ── Rutas ─────────────────────────────────────────────────────────────────────
@@ -311,7 +347,9 @@ def firmar():
         zip_bytes   = paquete["_raw"]
         nuevo_token = paquete["_nuevo_token"]
         cantidad    = paquete["_cantidad"]
-        print(f"Zip recibido: {len(zip_bytes)} bytes | {cantidad} documento(s)")
+        cuit        = paquete["_cuit"]
+        print(f"Zip recibido: {len(zip_bytes)} bytes | {cantidad} documento(s) | "
+              f"CUIT firmante: {cuit or 'no informado'}")
 
         job_id = uuid.uuid4().hex
         with _jobs_lock:
@@ -321,12 +359,14 @@ def firmar():
                 "procesados":  0,
                 "firmados":    [],
                 "nuevo_token": nuevo_token,
+                "cuit":        cuit,
                 "error":       None,
+                "detalle":     None,   # causa técnica si falla (para soporte)
                 "fin":         None,   # timestamp al terminar; lo usa _purgar_jobs
             }
 
         hilo = threading.Thread(
-            target=_procesar_job, args=(job_id, zip_bytes), daemon=True
+            target=_procesar_job, args=(job_id, zip_bytes, cuit), daemon=True
         )
         hilo.start()
 
