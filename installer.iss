@@ -26,6 +26,13 @@ WizardStyle=modern
 SetupIconFile=firmador.ico
 UninstallDisplayIcon={app}\{#MyAppExe}
 ArchitecturesInstallIn64BitMode=x64compatible
+; Si el servicio está corriendo, el .exe queda lockeado y la actualización falla
+; en silencio. Restart Manager detecta el lock y lo cierra; el mutex (lo crea
+; tray_app.py) es el respaldo por si RM no llega a verlo. No relanzamos desde RM:
+; ya lo hace la entrada de [Run] al terminar.
+CloseApplications=yes
+CloseApplicationsFilter=*.exe
+RestartApplications=no
 
 [Languages]
 Name: "es"; MessagesFile: "compiler:Languages\Spanish.isl"
@@ -47,6 +54,57 @@ Name: "{userstartup}\{#MyAppName}";        Filename: "{app}\{#MyAppExe}"; Tasks:
 [Run]
 Filename: "{app}\{#MyAppExe}"; Description: "Iniciar {#MyAppName} ahora"; Flags: nowait postinstall skipifsilent
 
+[UninstallRun]
+; Antes de borrar archivos: si el servicio quedó abierto, cerrarlo.
+Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM {#MyAppExe}"; Flags: runhidden; RunOnceId: "CerrarFirmador"
+
 [UninstallDelete]
 ; Datos de la app (log, output, .env) viven en LOCALAPPDATA\FirmadorToken.
 Type: filesandordirs; Name: "{localappdata}\FirmadorToken"
+
+[Code]
+const
+  MutexApp = 'FirmadorTokenSingleInstance';
+
+function ServicioCorriendo(): Boolean;
+begin
+  Result := CheckForMutexes(MutexApp);
+end;
+
+{ Cierra el servicio si está corriendo. False = el usuario dijo que no, o no murió. }
+function CerrarServicio(): Boolean;
+var
+  ResultCode, Intento: Integer;
+begin
+  Result := True;
+  if not ServicioCorriendo() then
+    Exit;
+
+  if MsgBox('El servicio de firma está corriendo y hay que cerrarlo para poder actualizarlo.'
+            + #13#13 + '¿Cerrarlo ahora? (se vuelve a abrir solo al terminar la instalación)',
+            mbConfirmation, MB_YESNO) <> IDYES then begin
+    Result := False;
+    Exit;
+  end;
+
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM {#MyAppExe}', '',
+       SW_HIDE, ewWaitUntilTerminated, ResultCode);
+
+  { taskkill vuelve antes de que el proceso termine de morir: esperar al mutex. }
+  for Intento := 1 to 20 do begin
+    if not ServicioCorriendo() then
+      Break;
+    Sleep(250);
+  end;
+
+  Result := not ServicioCorriendo();
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  Result := '';
+  if not CerrarServicio() then
+    Result := 'El servicio de firma sigue abierto, así que la actualización no se puede aplicar.'
+              + #13#13 + 'Cerralo con click derecho en el icono de la bandeja (junto al reloj) '
+              + '→ "Cerrar servicio", y volvé a ejecutar el instalador.';
+end;

@@ -23,6 +23,7 @@ if getattr(sys, "frozen", False) or sys.stdout is None:
     sys.stdout = _log
     sys.stderr = _log
 
+import ctypes
 import threading
 import webbrowser
 
@@ -35,6 +36,30 @@ from server import app, PORT, OUTPUT_DIR, DATA_DIR, BASE_URL
 
 HEALTH_URL = f"http://127.0.0.1:{PORT}/health"
 APP_TITLE  = "Firmador Token"
+
+# Mutex de instancia única. Sirve para dos cosas:
+#   1) evitar dos procesos peleando por el puerto (el segundo Flask no bindea y
+#      el icono queda vivo pero sin API),
+#   2) que el instalador (AppMutex en installer.iss) sepa que el servicio está
+#      corriendo y lo cierre antes de reemplazar el .exe.
+# Sin prefijo => namespace de la sesión, que es lo que corresponde a una
+# instalación per-user: no molesta si otro usuario de la misma PC lo tiene abierto.
+MUTEX_NAME          = "FirmadorTokenSingleInstance"
+ERROR_ALREADY_EXISTS = 183
+_mutex_handle       = None  # global: si se libera, se cierra el mutex
+
+
+# ── Instancia única ───────────────────────────────────────────────────────────
+
+def _tomar_instancia_unica() -> bool:
+    """True si esta es la única instancia; False si ya hay otra corriendo."""
+    global _mutex_handle
+    kernel32 = ctypes.windll.kernel32
+    _mutex_handle = kernel32.CreateMutexW(None, False, MUTEX_NAME)
+    if not _mutex_handle:
+        print(f"No se pudo crear el mutex ({kernel32.GetLastError()}); sigo igual.")
+        return True
+    return kernel32.GetLastError() != ERROR_ALREADY_EXISTS
 
 
 # ── Icono ─────────────────────────────────────────────────────────────────────
@@ -100,6 +125,10 @@ def _cerrar(icon, item) -> None:
 
 def main() -> None:
     print(f"Arrancando {APP_TITLE} | puerto {PORT} | backend {BASE_URL} | datos {DATA_DIR}")
+
+    if not _tomar_instancia_unica():
+        print("Ya hay una instancia corriendo; salgo.")
+        return
 
     threading.Thread(target=_run_server, daemon=True).start()
 
