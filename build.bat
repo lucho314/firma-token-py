@@ -13,7 +13,7 @@ pyinstaller --noconfirm --clean firmador.spec
 if errorlevel 1 goto :err
 
 echo.
-echo OK -> dist\FirmadorToken.exe
+echo OK -^> dist\FirmadorToken.exe
 echo.
 echo Para el instalador todo-en-uno, compilar con Inno Setup:
 echo    iscc installer.iss

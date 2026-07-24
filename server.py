@@ -382,11 +382,14 @@ def firmar():
     _purgar_jobs()
 
     try:
-        # CUIT del token conectado: se envía al backend para que devuelva sólo los
-        # documentos que le tocan a ESTE profesional (titular o interviniente), y es
-        # el certificado con el que se firma.
-        cuit = _cuit_local()
-        print(f"CUIT del token local: {cuit or 'no detectado'}")
+        # CUIT con el que firmar. Si el front lo indica (el usuario eligió un cert
+        # entre varios), se respeta; si no, se autodetecta el del token conectado.
+        # Se envía al backend para que devuelva sólo los documentos que le tocan a
+        # ESE profesional (titular o interviniente), y es el cert con el que se firma.
+        cuit_req = data.get("cuit") or data.get("Cuit")
+        cuit = re.sub(r"\D", "", cuit_req) if cuit_req else _cuit_local()
+        print(f"CUIT a firmar: {cuit or 'no detectado'} "
+              f"({'elegido por el usuario' if cuit_req else 'autodetectado'})")
 
         # Descarga sincrónica del ZIP (rápido) — la firma va en background
         paquete     = _fetch_paquete(token, cuit)
@@ -420,6 +423,17 @@ def firmar():
     except urllib.error.HTTPError as e:
         detalle = e.read().decode(errors="replace")
         print(f"API error {e.code}: {detalle}")
+
+        # El backend manda {"message": "..."} en los 4xx; usar ese texto si viene.
+        mensaje_api = detalle
+        try:
+            mensaje_api = json.loads(detalle).get("message") or detalle
+        except Exception:
+            pass
+
+        if e.code == 403:
+            # El CUIT del token no es firmante habilitado del trámite.
+            return jsonify({"error": mensaje_api}), 403
         if e.code == 404:
             return jsonify({"error": "No hay documentos pendientes de firma."}), 404
         return jsonify({"error": f"API respondió {e.code}", "detalle": detalle}), 502
@@ -440,6 +454,30 @@ def firmar_estado(job_id: str):
         if job is None:
             return jsonify({"error": "Job no encontrado"}), 404
         return jsonify(dict(job))
+
+
+@app.get("/certificados")
+def certificados():
+    """
+    Lista los certificados de firma válidos del equipo, para que el front deje
+    elegir cuál usar cuando hay más de uno. No expone el DER ni la clave: sólo
+    los datos necesarios para mostrarlos.
+    """
+    try:
+        from windows_cng import list_cng_certs
+        certs = [
+            {
+                "cn":           c.get("cn"),
+                "cuit":         c.get("cuit"),
+                "valido_hasta": str(c.get("valid_to")) if c.get("valid_to") else None,
+            }
+            for c in list_cng_certs()
+        ]
+        return jsonify({"certificados": certs})
+    except Exception as e:
+        print(f"No se pudieron listar certificados: {e}")
+        return jsonify({"error": "No se pudieron leer los certificados del equipo.",
+                        "detalle": str(e)}), 500
 
 
 @app.get("/health")
